@@ -392,9 +392,7 @@ def test_qwen3_coder_unterminated_call_with_many_parameters_is_not_exponential()
         (False, False),
     ],
 )
-def test_qwen3_coder_truncated_function_name_fallback_is_gated_on_finished(
-    finished, expect_call
-):
+def test_qwen3_coder_truncated_function_name_fallback_is_gated_on_finished(finished, expect_call):
     text = "<tool_call>\n<function=get"
     info = Qwen3CoderToolParser.parse(text, tools=GRAMMAR_TOOLS, finished=finished)
     _, metadata = info

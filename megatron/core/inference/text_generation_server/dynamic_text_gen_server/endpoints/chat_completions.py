@@ -702,12 +702,7 @@ try:
     bp = Blueprint('chat_completions_api', __name__)
 
     def apply_parsers(
-        message_text,
-        tools,
-        parsers_list,
-        tools_requested,
-        chat_template_kwargs=None,
-        finished=True,
+        message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None, finished=True
     ):
         """Runs CPU-intensive text parsing.
 

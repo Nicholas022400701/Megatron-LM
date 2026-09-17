@@ -276,9 +276,7 @@ class _Qwen3CoderToolParser:
     #     end-of-string terminator, so an unclosed parameter is dropped rather
     #     than salvaged.
     tool_call_parameter_regex = re.compile(
-        r"<\s*parameter\s*=\s*([^>]*)>"
-        r"(.*?)"
-        r"(?:<\s*/\s*parameter\s*>|(?=<\s*parameter\s*=))",
+        r"<\s*parameter\s*=\s*([^>]*)>" r"(.*?)" r"(?:<\s*/\s*parameter\s*>|(?=<\s*parameter\s*=))",
         re.DOTALL,
     )
 
@@ -395,10 +393,7 @@ class _Qwen3CoderToolParser:
         return function_calls
 
     def extract_tool_calls(
-        self,
-        model_output: str,
-        tools: list[ChatCompletionToolsParam] | None,
-        finished: bool = True,
+        self, model_output: str, tools: list[ChatCompletionToolsParam] | None, finished: bool = True
     ) -> ExtractedToolCallInformation:
         """Extracts the tool calls from the text using <tool_call>...</tool_call> tags.
 
