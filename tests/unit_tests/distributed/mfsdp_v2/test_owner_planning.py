@@ -44,7 +44,7 @@ def _mock_group(shapes, offsets, size, dp_size, this_rank=0):
     fsdp_parameters = tuple(SimpleNamespace(sharded=p) for p in params)
     return SimpleNamespace(
         mesh=_mock_mesh(dp_size, this_rank),
-        main_weight=SimpleNamespace(layout=layout),
+        main_weight=SimpleNamespace(layout=layout, dtype=torch.float32),
         fsdp_parameters=fsdp_parameters,
         sharded_parameters=params,
     )
@@ -269,6 +269,78 @@ def test_group_owner_layout_from_group_respects_eligible_fn():
     )
     assert list(plan.layouts) == [0, 1]
     assert set(plan.owners) == {0, 1}
+
+
+def _chunk_group():
+    """A 4-param group (dp_size 2): two same-shape params, one other shape, one 1D bias.
+
+    `GlobalLayout` size 60 → each rank's flat shard is 30 elements:
+    rank 0 [0,30), rank 1 [30,60).
+      - tensor 0 (6,3) at offset 0: elements (18, 0) — non-boundary, holder rank 0.
+      - tensor 1 (6,3) at offset 18: elements (12, 6) — boundary.
+      - tensor 2 (4,2) at offset 36: elements (0, 8) — non-boundary, holder rank 1.
+      - tensor 3 (16,) at offset 44: 1D, not participating.
+
+    With float32, each (6,3) parameter is 72 bytes and the (4,2) parameter is 32 bytes.
+    """
+    return _mock_group([(6, 3), (6, 3), (4, 2), (16,)], [0, 18, 36, 44], 60, dp_size=2)
+
+
+def test_select_partitions_the_plan():
+    """`select` restricts layouts/owners to the given indices, without rebalancing."""
+    plan = GroupOwnerLayout.from_group(_round_trip_group())
+    sub = plan.select((0, 2))
+
+    assert sub.group is plan.group
+    assert sub.mesh is plan.mesh
+    assert set(sub.layouts) == {0, 2}
+    assert set(sub.owners) == {0, 2}
+    # Owners are inherited from the global balancing pass, not recomputed.
+    assert sub.owners == {0: plan.owners[0], 2: plan.owners[2]}
+
+    # Non-participating indices fail loudly.
+    with pytest.raises(KeyError, match="not participating"):
+        plan.select((0, 7))
+
+    # An empty selection is a valid, empty (no-op) bundle.
+    empty = plan.select(())
+    assert empty.layouts == {}
+    assert empty.owners == {}
+
+
+def test_chunk_by_shape_groups_same_shapes():
+    """`chunk_by_shape` maps each shape to one chunk of its participating parameters."""
+    plan = GroupOwnerLayout.from_group(_chunk_group())
+    chunks = plan.chunk_by_shape()
+
+    assert set(chunks) == {torch.Size((6, 3)), torch.Size((4, 2))}
+    same_shape = chunks[torch.Size((6, 3))]
+    assert len(same_shape) == 1
+    assert set(same_shape[0].layouts) == {0, 1}
+    assert set(chunks[torch.Size((4, 2))][0].layouts) == {2}
+    # Chunk owners are inherited from the plan's global balancing.
+    for shape_chunks in chunks.values():
+        for chunk in shape_chunks:
+            assert chunk.owners == {i: plan.owners[i] for i in chunk.layouts}
+
+
+def test_chunk_by_shape_splits_large_shape_classes():
+    """`max_bytes_per_chunk` splits a shape class into same-shape chunks."""
+    plan = GroupOwnerLayout.from_group(_chunk_group())
+
+    # (6,3) parameters are 72 bytes each (float32); 72-byte chunks hold one each.
+    chunks = plan.chunk_by_shape(max_bytes_per_chunk=72)
+    same_shape = chunks[torch.Size((6, 3))]
+    assert [set(chunk.layouts) for chunk in same_shape] == [{0}, {1}]
+    # The chunks are disjoint and, together, cover the shape class.
+    assert len({i for chunk in same_shape for i in chunk.layouts}) == 2
+
+    # A parameter larger than the cap still forms its own (singleton) chunk.
+    chunks = plan.chunk_by_shape(max_bytes_per_chunk=40)
+    assert [set(chunk.layouts) for chunk in chunks[torch.Size((6, 3))]] == [{0}, {1}]
+
+    with pytest.raises(ValueError, match="positive"):
+        plan.chunk_by_shape(max_bytes_per_chunk=0)
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,9 @@ Pure parameter layout and owner-compute packing logic for MFSDP v2's all-`Flat`
   function.
 - `GroupOwnerLayout.from_group` builds a data structure capturing the per-group owner layout upon
   the above.
+- `GroupOwnerLayout.select` partitions a plan into sub-bundles, and
+  `GroupOwnerLayout.chunk_by_shape` groups same-shape parameters into chunks for per-chunk
+  pipelining with batched Newton-Schulz.
 - `OwnerGatherPlan.pack`/`OwnerScatterPlan.pack` take the `GroupOwnerLayout` plus this rank's data
   and build the flat P2P send/recv buffers,
 - `OwnerGatherPlan.reconstruct_full` stitches gathered shards back into the full flat tensor on the
@@ -19,7 +22,7 @@ Pure parameter layout and owner-compute packing logic for MFSDP v2's all-`Flat`
 """
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Self
 
 import torch
@@ -256,6 +259,73 @@ class GroupOwnerLayout:
     def mesh(self) -> DeviceMesh:
         """Device mesh of the group."""
         return self.group.mesh
+
+    def select(self, tensor_indices: Iterable[int]) -> Self:
+        """Return a sub-bundle over the given participating tensor indices.
+
+        The sub-bundle shares this plan's group (and mesh); `layouts` and `owners` are
+        restricted to the given tensor indices. Owners are inherited from this plan —
+        selection never re-runs the balancer, so partitioning a plan cannot skew the
+        global owner balance.
+
+        Args:
+            tensor_indices: Participating tensor indices to keep. Indices absent from
+                `layouts` raise `KeyError`; an empty selection yields an empty bundle
+                (a no-op pipeline stage).
+
+        Returns:
+            The sub-bundle over `tensor_indices`.
+        """
+        indices = tuple(tensor_indices)
+        for tensor_index in indices:
+            if tensor_index not in self.layouts:
+                raise KeyError(f"Tensor index {tensor_index} is not participating.")
+        return dataclasses.replace(
+            self,
+            layouts={i: self.layouts[i] for i in indices},
+            owners={i: self.owners[i] for i in indices},
+        )
+
+    def chunk_by_shape(
+        self, *, max_bytes_per_chunk: int | None = None
+    ) -> dict[torch.Size, list[Self]]:
+        """Partition the plan into same-shape chunks for per-chunk pipelining.
+
+        Groups the participating parameters by `ParameterLayout.full_shape`. Same-shape
+        parameters are the natural pipelining unit: their gathered full tensors stack into
+        one batched Newton-Schulz kernel, and a byte cap gives chunks a uniform data volume
+        across shape classes — a uniform wire time per chunk and a bounded owner footprint
+        for the gathered tensors.
+
+        Chunk bundles inherit the plan's globally balanced owners (see `select`). Chunks are
+        returned in first-appearance order, with tensor-index order within each shape. A
+        single parameter larger than `max_bytes_per_chunk` forms its own chunk.
+
+        Args:
+            max_bytes_per_chunk: Maximum number of bytes per chunk, computed from the
+                parameters' element counts and the group's `main_weight` dtype. `None`
+                puts every parameter of a shape into one chunk.
+
+        Returns:
+            Mapping from parameter shape to that shape's chunks, each a sub-bundle covering
+            a disjoint subset of the shape's participating parameters.
+        """
+        if max_bytes_per_chunk is not None and max_bytes_per_chunk <= 0:
+            raise ValueError(f"max_bytes_per_chunk must be positive, got {max_bytes_per_chunk}.")
+        itemsize = self.group.main_weight.dtype.itemsize
+        by_shape: dict[torch.Size, list[int]] = {}
+        for tensor_index, layout in self.layouts.items():
+            by_shape.setdefault(layout.full_shape, []).append(tensor_index)
+        chunks: dict[torch.Size, list[Self]] = {}
+        for shape, indices in by_shape.items():
+            size = len(indices)
+            if max_bytes_per_chunk is not None and shape.numel() > 0:
+                bytes_per_param = shape.numel() * itemsize
+                size = max(1, max_bytes_per_chunk // bytes_per_param)
+            chunks[shape] = [
+                self.select(indices[start : start + size]) for start in range(0, len(indices), size)
+            ]
+        return chunks
 
 
 @dataclasses.dataclass
