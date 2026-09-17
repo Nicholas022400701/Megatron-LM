@@ -1,19 +1,20 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Owner-compute P2P gather/scatter for M-FSDPv2 `DBuffer`s.
+"""Owner-compute P2P gather/scatter for MFSDP v2.
 
 `gather` moves each participating parameter's local chunks to its owner and reconstructs the
 full tensor there; `scatter` sends the owner's full result back as per-rank flat chunks. Both
 take the caller-built `GroupOwnerLayout` (who owns which parameter, and which rank holds which
-flat range) and a CUDA `stream`, operating on one `DBuffer` at a time so multiple param groups
-can be pipelined on different streams.
+flat range) and a CUDA `stream`, operating on one set of parameters at a time so multiple
+param groups can be pipelined on different streams.
 
 Design principles:
 
-1. No packing: `DBuffer` local views are used directly as P2P send buffers, and result chunks
-   are flat slices of the owner's full result, so no intermediate flat buffers or offset
-   bookkeeping are allocated. (`OwnerGatherPlan`/`OwnerScatterPlan` in `owner_planning`
-   implement the packed alternative, which trades fewer P2P ops for a copy per buffer.)
+1. No packing: the caller's local chunks (e.g., `DBuffer` local views) are used directly as
+   P2P send buffers, and result chunks are flat slices of the owner's full result, so no
+   intermediate flat buffers or offset bookkeeping are allocated.
+   (`OwnerGatherPlan`/`OwnerScatterPlan` in `owner_planning` implement the packed
+   alternative, which trades fewer P2P ops for a copy per buffer.)
 
 2. Stream-scoped execution: each function issues `batch_isend_irecv` and assembles the
    results on the given `stream`, waiting there. The caller's stream is never blocked, so
@@ -35,7 +36,6 @@ from contextlib import contextmanager
 import torch
 import torch.distributed as dist
 
-from .dbuffer import DBuffer
 from .owner_planning import GroupOwnerLayout
 
 
@@ -59,27 +59,30 @@ def _waiting_stream_scope(stream: torch.cuda.Stream | None) -> Iterator[None]:
 
 
 def gather(
-    source: DBuffer,
+    source: dict[int, torch.Tensor],
     destination: dict[int, torch.Tensor],
     *,
     plan: GroupOwnerLayout,
     stream: torch.cuda.Stream | None = None,
 ) -> None:
-    """Gather full tensors from a `DBuffer` to their owners via P2P.
+    """Gather full tensors from local chunks to their owners via P2P.
 
     For each participating parameter (a key of `plan.layouts`):
 
     - If this rank owns it, `destination[i]` is filled with the full flat tensor,
       reconstructed by concatenating the per-rank chunks in rank order (which is global
-      element order).
+      element order). A parameter only this rank holds elements of never communicates: its
+      single chunk is copied straight into `destination[i]`.
     - Otherwise this rank's local chunk is sent to the owner.
 
-    No packing: `source.get_local_tensor(i)` views are used directly as send buffers; recv
-    buffers are flat tensors allocated inside this function.
+    No packing: the caller's local chunks (e.g., `DBuffer` local views) are used directly as
+    send buffers; recv buffers are flat tensors allocated inside this function.
 
     Args:
-        source: `DBuffer` whose local chunks are gathered to the owners. Its layout must
-            match `plan`'s (the same group's buffers).
+        source: Local chunk per parameter this rank holds elements of, in any shape with the
+            matching number of elements. Entries for zero-element parameters are never read.
+            `DBuffer` local views — `{i: dbuffer.get_local_tensor(i) for ...}` — are a
+            natural way to fill this.
         destination: Preallocated full tensor per owned parameter, in any shape with the
             matching number of elements; filled with the flat content viewed into the
             destination's shape. Entries for parameters this rank does not own are never
@@ -89,12 +92,16 @@ def gather(
             stream; the caller's stream is never blocked. `None` means the current stream.
             Wait on `stream` before reading `destination`.
     """
-    mesh = source.mesh
+    mesh = plan.mesh
     world_size = mesh.size()
     this_rank = mesh.get_local_rank()
     group = mesh.get_group()
-    device = source.local_buffer.device
     owned = [i for i in plan.layouts if plan.owners[i] == this_rank]
+
+    # All chunks share dtype and device; take any available one for the recv buffers.
+    reference = next(iter(source.values()), None)
+    if owned:
+        assert reference is not None, "gather needs at least one source chunk to infer dtype"
 
     # Allocate flat recv buffers for owned parameters (one per (parameter, source) pair).
     recv_chunks: dict[tuple[int, int], torch.Tensor] = {}
@@ -105,16 +112,16 @@ def gather(
                 continue
             numel = layout.rank_numel(src)
             if numel > 0:
-                recv_chunks[(i, src)] = torch.empty(numel, dtype=source.dtype, device=device)
+                recv_chunks[(i, src)] = torch.empty(
+                    numel, dtype=reference.dtype, device=reference.device
+                )
 
     # Build the P2P ops: send non-owned chunks to their owners, receive owned ones.
     ops: list[dist.P2POp] = []
     for i in plan.layouts:
-        if plan.owners[i] == this_rank:
+        if plan.owners[i] == this_rank or plan.layouts[i].rank_numel(this_rank) == 0:
             continue
-        chunk = source.get_local_tensor(i)
-        if chunk.numel() == 0:
-            continue
+        chunk = source[i]
         ops.append(dist.P2POp(dist.isend, chunk, peer=plan.owners[i], group=group))
     for (i, src), buf in recv_chunks.items():
         ops.append(dist.P2POp(dist.irecv, buf, peer=src, group=group))
@@ -130,7 +137,7 @@ def gather(
             chunks: list[torch.Tensor] = []
             for src in range(world_size):
                 if src == this_rank:
-                    own = source.get_local_tensor(i)
+                    own = source[i]
                     if own.numel() > 0:
                         chunks.append(own.reshape(-1))
                 else:

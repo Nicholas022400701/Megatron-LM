@@ -81,6 +81,15 @@ def _make_dbuffer(mesh, device, tensor_shapes):
     return dbuffer, full_tensors, plan
 
 
+def _local_chunks(dbuffer, plan, this_rank):
+    """The gather source dict: the `DBuffer`'s local views for held parameters."""
+    return {
+        i: dbuffer.get_local_tensor(i)
+        for i in plan.layouts
+        if plan.layouts[i].rank_numel(this_rank) > 0
+    }
+
+
 def test_gather_scatter_round_trip():
     """gather -> scatter identity round-trip: `DBuffer` data is unchanged.
 
@@ -98,7 +107,7 @@ def test_gather_scatter_round_trip():
     destination = {
         i: torch.empty(full_tensors[i].shape, dtype=dbuffer.dtype, device=device) for i in owned
     }
-    gather(dbuffer, destination, plan=plan)
+    gather(_local_chunks(dbuffer, plan, this_rank), destination, plan=plan)
 
     # Owners got the correct full tensors; nothing else was written.
     for i in owned:
@@ -138,7 +147,7 @@ def test_gather_scatter_with_stream():
     destination = {
         i: torch.empty(full_tensors[i].shape, dtype=dbuffer.dtype, device=device) for i in owned
     }
-    gather(dbuffer, destination, plan=plan, stream=stream)
+    gather(_local_chunks(dbuffer, plan, this_rank), destination, plan=plan, stream=stream)
     stream.synchronize()
 
     for i in owned:
