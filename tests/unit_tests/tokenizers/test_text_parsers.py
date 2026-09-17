@@ -313,6 +313,27 @@ def test_qwen3_coder_tool_call_end_inside_value_does_not_terminate_the_call():
     assert call_args(body) == {"a": "see </tool_call> here"}
 
 
+def test_qwen3_coder_tool_call_end_after_unclosed_parameter_still_terminates_the_call():
+    """A genuine </tool_call> must not be skipped over just because it is
+    followed, later in the string, by an unrelated </parameter>.
+
+    The atomic parameter-block skip in `_find_matching_tool_call_end` is
+    driven by a single precomputed list of `</parameter>` positions with no
+    boundary information tying a given `</parameter>` to the `<parameter=...>`
+    it is meant to close. If a parameter inside the call is opened but never
+    closed, the skip must not borrow a later, unrelated `</parameter>`
+    (belonging to text after this call) and jump past the call's real
+    `</tool_call>` in the process.
+    """
+    body = "<tool_call><function=f><parameter=a>x</tool_call>tail<parameter=b>y</parameter>"
+    # `a` is left open (no `</parameter>`) inside the call, so it is not
+    # salvaged as an argument -- same as on `dc855ea4` before this file's
+    # linear-time rewrite. What matters here is that the call body stops at
+    # the real `</tool_call>` and does not swallow `tail` or invent `b` from
+    # text that belongs to what comes after the call.
+    assert call_args(body) == {}
+
+
 @pytest.mark.parametrize(
     "text,expected_name",
     [

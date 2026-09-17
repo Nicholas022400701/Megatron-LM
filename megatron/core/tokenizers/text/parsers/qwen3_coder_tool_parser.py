@@ -218,6 +218,21 @@ def _find_matching_tool_call_end(text: str, start: int) -> Optional[int]:
                 close_ptr += 1
                 continue
         i += 1
+    # `closes` has no boundary information tying a `</parameter>` to the
+    # `<parameter=...>` it atomically skips past: if that parameter is never
+    # actually closed, the skip can land on a `</parameter>` belonging to
+    # text after this call's genuine `</tool_call>`, stepping over it. The
+    # forward scan above only reaches here without returning if it never saw
+    # a bare `</tool_call>` at the current position -- which, for a skip that
+    # wrongly jumped past one, is exactly the failure mode. So before
+    # salvaging everything to end of string, check whether a literal
+    # `</tool_call>` exists anywhere at or after `start`: if it does, the
+    # skip above stepped over it and it is the real terminator; if it
+    # doesn't, this is a genuinely truncated call and the fallback below is
+    # correct.
+    literal_end = text.find(_TOOL_CALL_END, start)
+    if literal_end != -1:
+        return literal_end + len(_TOOL_CALL_END)
     return None
 
 
